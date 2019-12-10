@@ -10,7 +10,6 @@
 
 -export([squery/1, squery/2, squery/3,
          equery/2, equery/3, equery/4,
-         prepared_query/4, prepared_query/5,
          with_transaction/2, with_transaction/3]).
 
 -export([start_link/1]).
@@ -21,7 +20,6 @@
 -record(state, {conn::pid(),
                 delay::pos_integer(),
                 timer::timer:tref(),
-                pq::dict:new(),
                 start_args::proplists:proplist()}).
 
 -define(INITIAL_DELAY, 500). % Half a second
@@ -69,16 +67,6 @@ equery(PoolName, Sql, Params, Timeout) ->
                                                    Timeout)
                            end, Timeout).
 
-prepared_query(PoolName, QueryName, Sql, Params) ->
-  prepared_query(PoolName, QueryName, Sql, Params, ?TIMEOUT).
-
-prepared_query(PoolName, QueryName, Sql, Params, Timeout) ->
-  middle_man_transaction(PoolName,
-                         fun (W) ->
-                             gen_server:call(W, {prepared_query, QueryName, Sql, Params},
-                                             Timeout)
-                         end, Timeout).
-
 with_transaction(PoolName, Fun) ->
     with_transaction(PoolName, Fun, ?TIMEOUT).
 
@@ -112,7 +100,7 @@ start_link(Args) ->
 
 init(Args) ->
     process_flag(trap_exit, true),
-    {ok, connect(#state{start_args = Args, pq = dict:new(), delay = ?INITIAL_DELAY})}.
+    {ok, connect(#state{start_args = Args, delay = ?INITIAL_DELAY})}.
 
 handle_call(_Query, _From, #state{conn = undefined} = State) ->
     {reply, {error, disconnected}, State};
@@ -122,23 +110,6 @@ handle_call({squery, Sql}, _From,
 handle_call({equery, Sql, Params}, _From,
             #state{conn = Conn} = State) ->
     {reply, epgsql:equery(Conn, Sql, Params), State};
-handle_call({prepared_query, QueryName, Sql, Params}, _From,
-            #state{conn = Conn, pq = PreparedQuerys} = State) ->
-    {Answer, NS} =
-      case dict:find(QueryName, PreparedQuerys) of
-        {ok, _} ->
-          {epgsql:prepared_query(Conn, QueryName, Params), State};
-        _ ->
-          case epgsql:parse(Conn, QueryName, Sql, []) of
-            {error, R} ->
-              {{error, R}, State};
-            {ok, _} ->
-              NPQ = dict:store(QueryName, true, PreparedQuerys),
-              {epgsql:prepared_query(Conn, QueryName, Params),
-               State#state{pq = NPQ}}
-          end
-      end,
-    {reply, Answer, NS};
 handle_call({transaction, Fun}, _From,
             #state{conn = Conn} = State) ->
     put(?STATE_VAR, Conn),

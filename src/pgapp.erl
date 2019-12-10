@@ -12,7 +12,6 @@
 -export([connect/1, connect/2,
          equery/2, equery/3, equery/4,
          squery/1, squery/2, squery/3,
-         prepared_query/4, prepared_query/5,
          with_transaction/1, with_transaction/2, with_transaction/3]).
 
 %%%===================================================================
@@ -81,25 +80,6 @@ squery(Sql, Timeout) ->
                [epgsql:reply(epgsql:squery_row())] | {error, Reason :: any()}.
 squery(PoolName, Sql, Timeout) ->
     pgapp_worker:squery(PoolName, Sql, Timeout).
-
--spec prepared_query(PoolName     :: atom(),
-                     QueryName    :: string(),
-                     Sql          :: epgsql:sql_query(),
-                     Params       :: list(epgsql:bind_param()))
-                    -> epgsql:reply(epgsql:equery_row()).
-prepared_query(PoolName, QueryName, Sql, Params) ->
-    pgapp_worker:prepared_query(PoolName, QueryName, Sql, Params).
-
--spec prepared_query(PoolName     :: atom(),
-                     QueryName    :: string(),
-                     Sql          :: epgsql:sql_query(),
-                     Params       :: list(epgsql:bind_param()),
-                     Timeout      :: atom() | integer())
-                    -> epgql:reply().
-prepared_query(PoolName, QueryName, Sql, Params, Timeout) ->
-    pgapp_worker:prepared_query(PoolName, QueryName, Sql, Params, Timeout).
-
-
 
 -spec with_transaction(Function :: fun(() -> Reply))
                       -> Reply | {rollback | error, any()} when Reply :: any().
