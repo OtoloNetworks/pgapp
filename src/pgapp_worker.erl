@@ -10,6 +10,7 @@
 
 -export([squery/1, squery/2, squery/3,
          equery/2, equery/3, equery/4,
+         batch/2, batch/3, batch/4,
          with_transaction/2, with_transaction/3]).
 
 -export([start_link/1]).
@@ -20,7 +21,9 @@
 -record(state, {conn::pid(),
                 delay::pos_integer(),
                 timer::timer:tref(),
-                start_args::proplists:proplist()}).
+                start_args::proplists:proplist(),
+                stmt_cache::dict:dict()
+               }).
 
 -define(INITIAL_DELAY, 500). % Half a second
 -define(MAXIMUM_DELAY, 5 * 60 * 1000). % Five minutes
@@ -67,6 +70,26 @@ equery(PoolName, Sql, Params, Timeout) ->
                                                    Timeout)
                            end, Timeout).
 
+batch(Batch, Params) ->
+    case get(?STATE_VAR) of
+        undefined ->
+            equery(epgsql_pool, Batch, Params);
+        Conn ->
+            epgsql:equery(Conn, Batch, Params)
+    end.
+
+batch(PoolName, Batch, Params) when is_atom(PoolName) ->
+    batch(PoolName, Batch, Params, ?TIMEOUT);
+batch(Batch, Params, Timeout) ->
+    batch(epgsql_pool, Batch, Params, Timeout).
+
+batch(PoolName, Batch, Params, Timeout) ->
+    middle_man_transaction(PoolName,
+                           fun (W) ->
+                                   gen_server:call(W, {batch, Batch, Params},
+                                                   Timeout)
+                           end, Timeout).
+
 with_transaction(PoolName, Fun) ->
     with_transaction(PoolName, Fun, ?TIMEOUT).
 
@@ -79,11 +102,22 @@ with_transaction(PoolName, Fun, Timeout) ->
 
 middle_man_transaction(Pool, Fun, Timeout) ->
     Tag = make_ref(),
+    Parent = self(),
     {Receiver, Ref} = erlang:spawn_monitor(
                         fun() ->
+                                %% io:format("~p: Spawned ~p~n", [Parent, self()]),
                                 process_flag(trap_exit, true),
-                                Result = poolboy:transaction(Pool, Fun,
-                                                             Timeout),
+                                W = poolboy:checkout(Pool),
+                                %% io:format("~p: Got poolboy process ~p~n", [Parent, W]),
+                                Result =
+                                    try Fun(W) of
+                                        R -> R
+                                    catch
+                                        exit:{timeout, _} ->
+                                            %% io:format("TIMED OUT.....~n", []),
+                                            {error, timeout}
+                                    end,
+                                poolboy:checkin(Pool, W),
                                 exit({self(),Tag,Result})
                         end),
     receive
@@ -100,8 +134,11 @@ start_link(Args) ->
 
 init(Args) ->
     process_flag(trap_exit, true),
-    {ok, connect(#state{start_args = Args, delay = ?INITIAL_DELAY})}.
+    {ok, connect(#state{start_args = Args, delay = ?INITIAL_DELAY, stmt_cache = dict:new()})}.
 
+handle_call(cancel, _From, #state{conn = C} = State) ->
+    epgsql:cancel(C),
+    {reply, ok, State};
 handle_call(_Query, _From, #state{conn = undefined} = State) ->
     {reply, {error, disconnected}, State};
 handle_call({squery, Sql}, _From,
@@ -110,12 +147,16 @@ handle_call({squery, Sql}, _From,
 handle_call({equery, Sql, Params}, _From,
             #state{conn = Conn} = State) ->
     {reply, epgsql:equery(Conn, Sql, Params), State};
+handle_call({batch, Batch, Params}, _From, State) ->
+    {Results, NS} = process_batch(Batch, Params, State),
+    {reply, Results, NS};
 handle_call({transaction, Fun}, _From,
             #state{conn = Conn} = State) ->
     put(?STATE_VAR, Conn),
     Result = epgsql:with_transaction(Conn, fun(_) -> Fun() end),
     erase(?STATE_VAR),
     {reply, Result, State}.
+
 
 handle_cast(reconnect, State) ->
     {noreply, connect(State)}.
@@ -139,7 +180,7 @@ handle_info({'EXIT', From, Reason}, State) ->
     error_logger:warning_msg(
       "~p EXIT from ~p: ~p - attempting to reconnect in ~p ms~n",
       [self(), From, Reason, NewDelay]),
-    {noreply, State#state{conn = undefined, delay = NewDelay, timer = Tref}}.
+    {noreply, State#state{conn = undefined, delay = NewDelay, timer = Tref, stmt_cache = dict:new()}}.
 
 terminate(_Reason, #state{conn = undefined}) ->
     ok;
@@ -156,13 +197,19 @@ connect(State) ->
     Database = proplists:get_value(database, Args),
     Username = proplists:get_value(username, Args),
 
+    case is_pid(State#state.conn) of
+        true -> epgsql:close(State#state.conn);
+        _ -> ok
+                    
+    end,
+
     case epgsql:connect(Args) of
         {ok, Conn} ->
             error_logger:info_msg(
               "~p Connected to ~s at ~s with user ~s: ~p~n",
               [self(), Database, Hostname, Username, Conn]),
             timer:cancel(State#state.timer),
-            State#state{conn=Conn, delay=?INITIAL_DELAY, timer = undefined};
+            State#state{conn=Conn, delay=?INITIAL_DELAY, timer = undefined, stmt_cache = dict:new()};
         Error ->
             NewDelay = calculate_delay(State#state.delay),
             error_logger:warning_msg(
@@ -172,8 +219,32 @@ connect(State) ->
             {ok, Tref} =
                 timer:apply_after(
                   State#state.delay, gen_server, cast, [self(), reconnect]),
-            State#state{conn=undefined, delay = NewDelay, timer = Tref}
+            State#state{conn=undefined, delay = NewDelay, timer = Tref, stmt_cache = dict:new()}
     end.
+
+process_batch(Batch, Params, #state{conn = Conn, stmt_cache = SC} = State) ->
+    %% Extract unique statemnts
+    Stmts = lists:usort([X || {X, _} <- Batch]),
+    %% CHeck cache and parse if needs be, updating the cache
+    NSC =
+        lists:foldl(
+          fun(X, SC1) ->
+                  case dict:find(X, SC1) of
+                      {ok, V} -> SC1;
+                      _ -> case epgsql:parse(Conn, io_lib:format("~p", [erlang:make_ref()]), X, []) of
+                               {ok, S} ->
+                                   dict:store(X, S, SC1);
+                               E -> io:format("Parsing gave ~p~n", [E]),
+                                    SC1
+                           end
+                  end
+          end, SC, Stmts),
+    %% Map statements into the parsed variants
+    NewBatch = lists:map(fun({S, Y}) -> {dict:fetch(S, NSC), Y} end, Batch),
+    %% Process the batch
+    R = epgsql:execute_batch(Conn, NewBatch),
+    erlang:garbage_collect(self()),
+    {R, State#state{stmt_cache = NSC}}.
 
 calculate_delay(Delay) when (Delay * 2) >= ?MAXIMUM_DELAY ->
     ?MAXIMUM_DELAY;
